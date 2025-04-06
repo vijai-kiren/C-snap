@@ -6,11 +6,13 @@ import re
 # LEXICAL ANALYSIS
 # ==============================
 
-KEYWORDS = {'if', 'int', 'else', 'while', 'return'}
+KEYWORDS = {'int', 'return', 'if', 'else'}
 
 def tokenize(code):
     TOKEN_SPEC = [
-        ('NUMBER',   r'\d+'),
+        ('COMMENT_MULTI', r'/\*[\s\S]*?\*/'),      # Multiline comment
+        ('COMMENT_SINGLE', r'//.*'),               # Single line comment
+        ('NUMBER',    r'\d+'),                # Integer
         ('ID',       r'[a-zA-Z_]\w*'),
         ('OP',       r'(==|!=|<=|>=|[+\-*/=<>])'),
         ('LPAREN',   r'\('),
@@ -29,6 +31,8 @@ def tokenize(code):
     for mo in re.finditer(token_regex, code):
         kind = mo.lastgroup
         value = mo.group()
+        if kind in ['COMMENT_SINGLE', 'COMMENT_MULTI']:
+            continue  # Skip comments
         if kind == 'NUMBER':
             tokens.append(('NUMBER', value))
         elif kind == 'ID':
@@ -326,70 +330,157 @@ def generate_ir(ast):
     gen(ast)
     return ir
 
-def print_three_address_code(ir):
-    for instr in ir:
+def ir_to_three_address_code(ir_tuples):
+    tac_lines = []
+
+    for instr in ir_tuples:
         op, arg1, arg2, result = instr
+
         if op == 'LABEL':
-            print(f"{result}:")
-        elif op == 'DECL':
-            print(f"  int {result}")
+            tac_lines.append(f"{result}:")
         elif op == 'LOAD_CONST':
-            print(f"  {result} = {arg1}")
+            tac_lines.append(f"{result} = {arg1}")
+        elif op == 'ASSIGN':
+            tac_lines.append(f"{result} = {arg1}")
+        elif op in ('+', '-', '*', '/'):
+            tac_lines.append(f"{result} = {arg1} {op.lower()} {arg2}")
+        elif op == 'RETURN':
+            tac_lines.append(f"return {arg1}")
+        elif op == 'IFGOTO':
+            tac_lines.append(f"if {arg1} goto {result}")
+        elif op == 'GOTO' or op == 'JMP':
+            tac_lines.append(f"goto {result}")
+        elif op == 'JZ':  # Jump if zero (false)
+            tac_lines.append(f"ifFalse {arg1} goto {result}")
+        elif op == '>':
+            tac_lines.append(f"{result} = {arg1} > {arg2}")
+        elif op == '<':
+            tac_lines.append(f"{result} = {arg1} < {arg2}")
+        elif op == '==':
+            tac_lines.append(f"{result} = {arg1} == {arg2}")
         elif op == 'STORE':
-            print(f"  {result} = {arg1}")
-        elif op in {'+', '-', '*', '/', '<', '>', '==', '!='}:
-            print(f"  {result} = {arg1} {op} {arg2}")
-        elif op == 'JZ':
-            print(f"  if {arg1} == 0 goto {result}")
-        elif op == 'JMP':
-            print(f"  goto {result}")
+            tac_lines.append(f"{result} = {arg1}")
+        elif op == 'DECL':
+            tac_lines.append(f"declare {result}")
         else:
-            print(f"  {op} {arg1} {arg2} {result}")  # fallback
+            tac_lines.append(f"# Unrecognized op: {instr}")
+
+    return "\n".join(tac_lines)
+
 
 # ==============================
 # OPTIMIZATION (constant folding)
 # ==============================
 
-def optimize_ir(ir):
-    result = []
-    consts = {}
-    for op, a1, a2, res in ir:
+def optimize_ir(ir_tuples):
+    optimized = []
+    temp_values = {}  # Tracks temp values (like {'t1': '5'})
+    var_assignments = {}  # Tracks which temp gets assigned to which variable
+
+    i = 0
+    while i < len(ir_tuples):
+        op, arg1, arg2, result = ir_tuples[i]
+
         if op == 'LOAD_CONST':
-            consts[res] = int(a1)
-        elif op in ('+', '-', '*', '/') and a1 in consts and a2 in consts:
-            value = eval(f"{consts[a1]}{op}{consts[a2]}")
-            result.append(('LOAD_CONST', value, None, res))
-            consts[res] = value
-            continue
-        result.append((op, a1, a2, res))
-    return result
+            # Store the constant associated with the temp
+            temp_values[result] = arg1
+
+        elif op == 'STORE':
+            # Check if storing a temp that holds a constant
+            if arg1 in temp_values:
+                optimized.append(('ASSIGN', temp_values[arg1], None, result))
+                temp_values.pop(arg1)  # temp no longer needed
+            else:
+                optimized.append((op, arg1, arg2, result))
+
+        elif op in {'+', '-', '*', '/', '>', '<', '==', '!=', '>=', '<='}:
+            # Binary operations - pass through, keep temps
+            optimized.append((op, arg1, arg2, result))
+
+        elif op == 'DECL':
+            # Keep declarations
+            optimized.append((op, arg1, arg2, result))
+
+        elif op in {'JZ', 'JMP', 'LABEL', 'RETURN'}:
+            # Control flow ops
+            optimized.append((op, arg1, arg2, result))
+
+        else:
+            # Pass through anything else
+            optimized.append((op, arg1, arg2, result))
+
+        i += 1
+
+    return optimized
+
+
 
 # ==============================
 # CODE GENERATION (pseudo-ASM)
 # ==============================
 
 def generate_code(ir):
-    lines = []
-    for op, a1, a2, res in ir:
-        if op == 'LOAD_CONST':
-            lines.append(f"{res} = {a1}")
+    asm = []
+    reg_map = {}  # Mapping variables to registers
+    next_reg = 1  # Start with R1
+
+    def get_register(var):
+        nonlocal next_reg
+        if var not in reg_map:
+            reg_map[var] = f"R{next_reg}"
+            next_reg += 1
+        return reg_map[var]
+
+    for instr in ir:
+        op, arg1, arg2, result = instr
+
+        if op == 'LABEL':
+            asm.append(f"{result}:")
+        elif op == 'LOAD_CONST':
+            reg = get_register(result)
+            asm.append(f"MOV {reg}, {arg1}")
         elif op == 'STORE':
-            lines.append(f"{res} = {a1}")
-        elif op in ('+', '-', '*', '/', '<', '>', '<=', '>=', '==', '!='):
-            lines.append(f"{res} = {a1} {op} {a2}")
+            src = get_register(arg1)
+            dest = get_register(result)
+            asm.append(f"MOV {dest}, {src}")
+        elif op == 'ASSIGN':
+            dest = get_register(result)
+            asm.append(f"MOV {dest}, {arg1}")
         elif op == 'DECL':
-            lines.append(f"// declare {res}")
+            continue  # Declarations don’t need to generate assembly
+        elif op in ('+', '-', '*', '/'):
+            reg1 = get_register(arg1)
+            reg2 = get_register(arg2)
+            dest = get_register(result)
+
+            if op == '+':
+                asm_op = 'ADD'
+            elif op == '-':
+                asm_op = 'SUB'
+            elif op == '*':
+                asm_op = 'MUL'
+            elif op == '/':
+                asm_op = 'DIV'
+
+            asm.append(f"{asm_op} {dest}, {reg1}, {reg2}")
+        elif op == '>':
+            reg1 = get_register(arg1)
+            reg2 = get_register(arg2)
+            dest = get_register(result)
+            asm.append(f"CMPGT {dest}, {reg1}, {reg2}")
         elif op == 'JZ':
-            lines.append(f"IF {a1} == 0 GOTO {res}")
+            cond = get_register(arg1)
+            asm.append(f"JZ {cond}, {result}")
         elif op == 'JMP':
-            lines.append(f"GOTO {res}")
-        elif op == 'LABEL':
-            lines.append(f"{res}:")
+            asm.append(f"JMP {result}")
         elif op == 'RETURN':
-            lines.append(f"RETURN {a1}")
+            reg = get_register(arg1)
+            asm.append(f"RET {reg}")
         else:
-            lines.append(f"// {op} {a1} {a2} {res}")
-    return '\n'.join(lines)
+            asm.append(f"# Unrecognized operation: {op}")
+
+    return "\n".join(asm)
+
 
 # ==============================
 # GUI
@@ -409,8 +500,8 @@ def run_compiler():
         optimized_ir = optimize_ir(ir)
         codegen = generate_code(optimized_ir)
 
-        tac = generate_code(ir)
-        optimized_tac = generate_code(optimized_ir)
+        tac = ir_to_three_address_code(ir)
+        optimized_tac = ir_to_three_address_code(optimized_ir)
 
         ir_text = "=== IR (Tuples) ===\n"
         ir_text += "\n".join([str(instr) for instr in ir])
