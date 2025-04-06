@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import ttk
 import re
 
 # ==============================
@@ -134,7 +134,7 @@ def parse(tokens):
 
     def parse_arithmetic():
         node = parse_term()
-        while peek()[0] == 'OP' and peek()[1] in ('+', '-'):
+        while peek()[0] == 'OP' and peek()[1] in ('+', '-', '*', '/'):
             op = peek()[1]
             advance()
             right = parse_term()
@@ -468,6 +468,16 @@ def generate_code(ir):
             reg2 = get_register(arg2)
             dest = get_register(result)
             asm.append(f"CMPGT {dest}, {reg1}, {reg2}")
+        elif op == '<':
+            reg1 = get_register(arg1)
+            reg2 = get_register(arg2)
+            dest = get_register(result)
+            asm.append(f"CMPLT {dest}, {reg1}, {reg2}")
+        elif op == '==':
+            reg1 = get_register(arg1)
+            reg2 = get_register(arg2)
+            dest = get_register(result)
+            asm.append(f"CMPEQ {dest}, {reg1}, {reg2}")
         elif op == 'JZ':
             cond = get_register(arg1)
             asm.append(f"JZ {cond}, {result}")
